@@ -18,7 +18,9 @@ if (!TCB_ENV_ID) {
 }
 
 const cloudbaseApp = cloudbase.init({
-  env: TCB_ENV_ID
+  env: TCB_ENV_ID,
+  secretId: process.env.TCB_SECRET_ID,
+  secretKey: process.env.TCB_SECRET_KEY
 });
 
 const db = cloudbaseApp.database();
@@ -177,7 +179,10 @@ app.get("/health", (req, res) => {
     version: "cloudbase-db-v1",
     status: "running",
     env: TCB_ENV_ID || "",
-    collection: USERS_COLLECTION
+    collection: USERS_COLLECTION,
+    hasTokenSecret: Boolean(process.env.TOKEN_SECRET),
+    hasTcbSecretId: Boolean(process.env.TCB_SECRET_ID),
+    hasTcbSecretKey: Boolean(process.env.TCB_SECRET_KEY)
   }));
 });
 

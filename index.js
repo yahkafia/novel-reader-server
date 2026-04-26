@@ -263,6 +263,48 @@ app.post("/auth/nickname/check", async (req, res) => {
   }
 });
 
+app.post("/account/profile/update", authRequired, async (req, res) => {
+  try {
+    const nickname = String(req.body.nickname || "").trim();
+
+    if (!nickname || nickname.length > 20) {
+      return res.json(fail("昵称需为1-20个字符"));
+    }
+
+    const existed = await users
+      .where({
+        nickname,
+        deleted: false
+      })
+      .limit(1)
+      .get();
+
+    const duplicated = (existed.data || []).some(item => item.uid !== req.user.uid);
+
+    if (duplicated) {
+      return res.json(fail("昵称已被使用，请更换昵称"));
+    }
+
+    await users.doc(req.user._id).update({
+      nickname,
+      updatedAt: now()
+    });
+
+    const updatedUser = {
+      ...req.user,
+      nickname
+    };
+
+    res.json(ok({
+      user: toAccountUser(updatedUser, req.headers.authorization?.replace("Bearer ", "") || "")
+    }));
+  } catch (error) {
+    console.error("update profile failed:", error);
+    res.json(fail(error.message || "修改昵称失败"));
+  }
+});
+
+
 app.post("/auth/password/register", async (req, res) => {
   try {
     const account = normalizeAccount(req.body.account);

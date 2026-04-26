@@ -230,6 +230,39 @@ app.get("/health", (req, res) => {
   }));
 });
 
+app.post("/auth/nickname/check", async (req, res) => {
+  try {
+    const nickname = String(req.body.nickname || "").trim();
+
+    if (!nickname || nickname.length > 20) {
+      return res.json(ok({
+        available: false,
+        exists: false,
+        duplicate: false
+      }));
+    }
+
+    const result = await users
+      .where({
+        nickname,
+        deleted: false
+      })
+      .limit(1)
+      .get();
+
+    const exists = result.data && result.data.length > 0;
+
+    res.json(ok({
+      available: !exists,
+      exists,
+      duplicate: exists
+    }));
+  } catch (error) {
+    console.error("check nickname failed:", error);
+    res.json(fail(error.message || "昵称检测失败"));
+  }
+});
+
 app.post("/auth/password/register", async (req, res) => {
   try {
     const account = normalizeAccount(req.body.account);
@@ -261,6 +294,18 @@ app.post("/auth/password/register", async (req, res) => {
         return res.json(fail("该账号已注销，不能重复注册"));
       }
       return res.json(fail("账号已存在"));
+    }
+    
+    const nicknameResult = await users
+      .where({
+        nickname,
+        deleted: false
+      })
+      .limit(1)
+      .get();
+    
+    if (nicknameResult.data && nicknameResult.data.length > 0) {
+      return res.json(fail("昵称已被使用，请更换昵称"));
     }
 
     const uid = createUid();

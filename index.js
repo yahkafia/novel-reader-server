@@ -90,6 +90,50 @@ function toAccountUser(row, accessToken = "") {
   };
 }
 
+function toStats(row) {
+  return {
+    dayKey: Number(row.dayKey || 0),
+    todayReadingSeconds: Number(row.todayReadingSeconds || 0),
+    totalReadingSeconds: Number(row.totalReadingSeconds || 0),
+
+    todaySingleVoiceChars: safeNumber(row.todaySingleVoiceChars),
+    totalSingleVoiceChars: safeNumber(row.totalSingleVoiceChars),
+
+    todayRoleVoiceChars: safeNumber(row.todayRoleVoiceChars),
+    totalRoleVoiceChars: safeNumber(row.totalRoleVoiceChars),
+
+    todayInteractiveChars: safeNumber(row.todayInteractiveChars),
+    totalInteractiveChars: safeNumber(row.totalInteractiveChars)
+  };
+}
+
+function normalizeStatsFromBody(body) {
+  const totalSingleVoiceChars = safeNumber(body.totalSingleVoiceChars);
+  const totalRoleVoiceChars = safeNumber(body.totalRoleVoiceChars);
+  const totalInteractiveChars = safeNumber(body.totalInteractiveChars);
+
+  const computedTotalAudiobookChars =
+    totalSingleVoiceChars + totalRoleVoiceChars + totalInteractiveChars;
+
+  return {
+    dayKey: Number(body.dayKey || 0),
+
+    todayReadingSeconds: safeNumber(body.todayReadingSeconds),
+    totalReadingSeconds: safeNumber(body.totalReadingSeconds),
+
+    todaySingleVoiceChars: safeNumber(body.todaySingleVoiceChars),
+    totalSingleVoiceChars,
+
+    todayRoleVoiceChars: safeNumber(body.todayRoleVoiceChars),
+    totalRoleVoiceChars,
+
+    todayInteractiveChars: safeNumber(body.todayInteractiveChars),
+    totalInteractiveChars,
+
+    totalAudiobookChars: safeNumber(body.totalAudiobookChars || computedTotalAudiobookChars)
+  };
+}
+
 async function findUserByAccount(account) {
   const result = await users
     .where({
@@ -230,8 +274,19 @@ app.post("/auth/password/register", async (req, res) => {
       phone: "",
       avatarUrl: "",
       loginType: "password",
+
+      // 阅读与听书统计
+      dayKey: 0,
+      todayReadingSeconds: 0,
       totalReadingSeconds: 0,
+      todaySingleVoiceChars: 0,
+      totalSingleVoiceChars: 0,
+      todayRoleVoiceChars: 0,
+      totalRoleVoiceChars: 0,
+      todayInteractiveChars: 0,
+      totalInteractiveChars: 0,
       totalAudiobookChars: 0,
+
       deleted: false,
       createdAt: now(),
       updatedAt: now()
@@ -344,22 +399,87 @@ app.post("/account/delete", authRequired, async (req, res) => {
 
 app.post("/user/stats/sync", authRequired, async (req, res) => {
   try {
-    const totalReadingSeconds = safeNumber(req.body.totalReadingSeconds);
-    const totalAudiobookChars = safeNumber(req.body.totalAudiobookChars);
+    const incoming = normalizeStatsFromBody(req.body);
 
-    const oldReading = safeNumber(req.user.totalReadingSeconds);
-    const oldAudio = safeNumber(req.user.totalAudiobookChars);
+    const oldStats = {
+      dayKey: Number(req.user.dayKey || 0),
 
-    await users.doc(req.user._id).update({
-      totalReadingSeconds: Math.max(oldReading, totalReadingSeconds),
-      totalAudiobookChars: Math.max(oldAudio, totalAudiobookChars),
+      todayReadingSeconds: safeNumber(req.user.todayReadingSeconds),
+      totalReadingSeconds: safeNumber(req.user.totalReadingSeconds),
+
+      todaySingleVoiceChars: safeNumber(req.user.todaySingleVoiceChars),
+      totalSingleVoiceChars: safeNumber(req.user.totalSingleVoiceChars),
+
+      todayRoleVoiceChars: safeNumber(req.user.todayRoleVoiceChars),
+      totalRoleVoiceChars: safeNumber(req.user.totalRoleVoiceChars),
+
+      todayInteractiveChars: safeNumber(req.user.todayInteractiveChars),
+      totalInteractiveChars: safeNumber(req.user.totalInteractiveChars),
+
+      totalAudiobookChars: safeNumber(req.user.totalAudiobookChars)
+    };
+
+    const sameDay = incoming.dayKey > 0 && incoming.dayKey === oldStats.dayKey;
+
+    const merged = {
+      dayKey: incoming.dayKey || oldStats.dayKey,
+
+      // 今日统计：如果是同一天，取较大值；如果是新的一天，直接使用客户端今日值
+      todayReadingSeconds: sameDay
+        ? Math.max(oldStats.todayReadingSeconds, incoming.todayReadingSeconds)
+        : incoming.todayReadingSeconds,
+
+      todaySingleVoiceChars: sameDay
+        ? Math.max(oldStats.todaySingleVoiceChars, incoming.todaySingleVoiceChars)
+        : incoming.todaySingleVoiceChars,
+
+      todayRoleVoiceChars: sameDay
+        ? Math.max(oldStats.todayRoleVoiceChars, incoming.todayRoleVoiceChars)
+        : incoming.todayRoleVoiceChars,
+
+      todayInteractiveChars: sameDay
+        ? Math.max(oldStats.todayInteractiveChars, incoming.todayInteractiveChars)
+        : incoming.todayInteractiveChars,
+
+      // 累计统计：始终取较大值，避免旧客户端或重复同步把云端覆盖小
+      totalReadingSeconds: Math.max(oldStats.totalReadingSeconds, incoming.totalReadingSeconds),
+      totalSingleVoiceChars: Math.max(oldStats.totalSingleVoiceChars, incoming.totalSingleVoiceChars),
+      totalRoleVoiceChars: Math.max(oldStats.totalRoleVoiceChars, incoming.totalRoleVoiceChars),
+      totalInteractiveChars: Math.max(oldStats.totalInteractiveChars, incoming.totalInteractiveChars),
+      totalAudiobookChars: Math.max(oldStats.totalAudiobookChars, incoming.totalAudiobookChars),
+
       updatedAt: now()
-    });
+    };
 
-    res.json(ok());
+    await users.doc(req.user._id).update(merged);
+
+    res.json(ok({
+      stats: {
+        dayKey: merged.dayKey,
+        todayReadingSeconds: merged.todayReadingSeconds,
+        totalReadingSeconds: merged.totalReadingSeconds,
+        todaySingleVoiceChars: merged.todaySingleVoiceChars,
+        totalSingleVoiceChars: merged.totalSingleVoiceChars,
+        todayRoleVoiceChars: merged.todayRoleVoiceChars,
+        totalRoleVoiceChars: merged.totalRoleVoiceChars,
+        todayInteractiveChars: merged.todayInteractiveChars,
+        totalInteractiveChars: merged.totalInteractiveChars
+      }
+    }));
   } catch (error) {
     console.error("sync stats failed:", error);
     res.json(fail(error.message || "同步统计失败"));
+  }
+});
+
+app.post("/user/stats/get", authRequired, async (req, res) => {
+  try {
+    res.json(ok({
+      stats: toStats(req.user)
+    }));
+  } catch (error) {
+    console.error("get stats failed:", error);
+    res.json(fail(error.message || "获取统计数据失败"));
   }
 });
 

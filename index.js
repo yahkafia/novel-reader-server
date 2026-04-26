@@ -136,16 +136,31 @@ async function authRequired(req, res, next) {
   }
 }
 
+function withTimeout(promise, timeoutMs, message) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error(message)), timeoutMs);
+    })
+  ]);
+}
+
 app.get("/", async (req, res) => {
   const diag = {
     service: "novel-reader-account-server",
     version: "cloudbase-db-v1",
     env: TCB_ENV_ID || "",
-    collection: USERS_COLLECTION
+    collection: USERS_COLLECTION,
+    hasTokenSecret: Boolean(process.env.TOKEN_SECRET)
   };
 
   try {
-    await users.limit(1).get();
+    await withTimeout(
+      users.limit(1).get(),
+      5000,
+      "CloudBase 数据库访问超时，请检查 TCB_ENV_ID、数据库是否开通、集合是否存在、云托管是否有访问权限"
+    );
+
     res.json(ok({
       ...diag,
       database: "connected"
@@ -154,6 +169,16 @@ app.get("/", async (req, res) => {
     console.error("database check failed:", error);
     res.json(fail("CloudBase 数据库连接失败：" + error.message, diag));
   }
+});
+
+app.get("/health", (req, res) => {
+  res.json(ok({
+    service: "novel-reader-account-server",
+    version: "cloudbase-db-v1",
+    status: "running",
+    env: TCB_ENV_ID || "",
+    collection: USERS_COLLECTION
+  }));
 });
 
 app.post("/auth/password/register", async (req, res) => {

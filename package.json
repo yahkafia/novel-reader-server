@@ -6,9 +6,9 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "mysql2": "^3.11.5",
+    "@cloudbase/node-sdk": "^2.9.1",
     "bcryptjs": "^2.4.3",
+    "express": "^4.18.2",
     "jsonwebtoken": "^9.0.2"
   }
 }

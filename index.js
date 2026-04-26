@@ -1,5 +1,5 @@
 const express = require("express");
-const mysql = require("mysql2/promise");
+const cloudbase = require("@cloudbase/node-sdk");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const crypto = require("crypto");
@@ -7,27 +7,33 @@ const crypto = require("crypto");
 const app = express();
 app.use(express.json());
 
+const PORT = Number(process.env.PORT || 80);
+const TCB_ENV_ID = process.env.TCB_ENV_ID;
 const TOKEN_SECRET = process.env.TOKEN_SECRET || "dev_secret_change_me";
 const PASSWORD_SALT_ROUNDS = Number(process.env.PASSWORD_SALT_ROUNDS || 10);
+const USERS_COLLECTION = process.env.USERS_COLLECTION || "users";
 
-const pool = mysql.createPool({
-  host: process.env.MYSQL_HOST,
-  port: Number(process.env.MYSQL_PORT || 3306),
-  user: process.env.MYSQL_USER,
-  password: process.env.MYSQL_PASSWORD,
-  database: process.env.MYSQL_DATABASE,
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-  charset: "utf8mb4"
+if (!TCB_ENV_ID) {
+  console.warn("TCB_ENV_ID is not configured.");
+}
+
+const cloudbaseApp = cloudbase.init({
+  env: TCB_ENV_ID
 });
+
+const db = cloudbaseApp.database();
+const users = db.collection(USERS_COLLECTION);
 
 function ok(data = {}) {
   return { code: 0, message: "ok", data };
 }
 
-function fail(message) {
-  return { code: 1, message, data: {} };
+function fail(message, data = {}) {
+  return { code: 1, message, data };
+}
+
+function now() {
+  return Date.now();
 }
 
 function normalizeAccount(account) {
@@ -40,6 +46,10 @@ function validateAccount(account) {
 
 function validatePassword(password) {
   return typeof password === "string" && password.length >= 6 && password.length <= 32;
+}
+
+function validateNickname(nickname) {
+  return typeof nickname === "string" && nickname.trim().length >= 1 && nickname.trim().length <= 20;
 }
 
 function createUid() {
@@ -60,15 +70,46 @@ function createToken(user) {
   );
 }
 
+function safeNumber(value) {
+  const n = Number(value || 0);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.floor(n);
+}
+
 function toAccountUser(row, accessToken = "") {
   return {
-    uid: row.uid,
+    uid: row.uid || "",
+    account: row.account || "",
     nickname: row.nickname || "阅读用户",
     phone: row.phone || "",
-    avatarUrl: row.avatar_url || "",
-    loginType: row.login_type || "password",
+    avatarUrl: row.avatarUrl || "",
+    loginType: row.loginType || "password",
     accessToken
   };
+}
+
+async function findUserByAccount(account) {
+  const result = await users
+    .where({
+      account,
+      deleted: false
+    })
+    .limit(1)
+    .get();
+
+  return result.data && result.data.length > 0 ? result.data[0] : null;
+}
+
+async function findUserByUid(uid) {
+  const result = await users
+    .where({
+      uid,
+      deleted: false
+    })
+    .limit(1)
+    .get();
+
+  return result.data && result.data.length > 0 ? result.data[0] : null;
 }
 
 async function authRequired(req, res, next) {
@@ -81,32 +122,37 @@ async function authRequired(req, res, next) {
     }
 
     const payload = jwt.verify(token, TOKEN_SECRET);
-    const [rows] = await pool.execute(
-      "SELECT * FROM users WHERE uid = ? AND deleted = 0 LIMIT 1",
-      [payload.uid]
-    );
+    const user = await findUserByUid(payload.uid);
 
-    if (!rows.length) {
+    if (!user) {
       return res.json(fail("账号不存在或已注销"));
     }
 
-    req.user = rows[0];
+    req.user = user;
     next();
   } catch (error) {
+    console.error("auth failed:", error);
     return res.json(fail("登录状态已失效，请重新登录"));
   }
 }
 
 app.get("/", async (req, res) => {
+  const diag = {
+    service: "novel-reader-account-server",
+    version: "cloudbase-db-v1",
+    env: TCB_ENV_ID || "",
+    collection: USERS_COLLECTION
+  };
+
   try {
-    await pool.query("SELECT 1");
+    await users.limit(1).get();
     res.json(ok({
-      service: "novel-reader-account-server",
-      version: "password-mysql-v1",
-      mysql: "connected"
+      ...diag,
+      database: "connected"
     }));
   } catch (error) {
-    res.json(fail("MySQL连接失败：" + error.message));
+    console.error("database check failed:", error);
+    res.json(fail("CloudBase 数据库连接失败：" + error.message, diag));
   }
 });
 
@@ -124,36 +170,50 @@ app.post("/auth/password/register", async (req, res) => {
       return res.json(fail("密码长度需为6-32位"));
     }
 
-    const [exists] = await pool.execute(
-      "SELECT uid FROM users WHERE account = ? LIMIT 1",
-      [account]
-    );
+    if (!validateNickname(nickname)) {
+      return res.json(fail("昵称需为1-20个字符"));
+    }
 
-    if (exists.length) {
+    const existed = await users
+      .where({
+        account
+      })
+      .limit(1)
+      .get();
+
+    if (existed.data && existed.data.length > 0) {
+      const old = existed.data[0];
+      if (old.deleted === true) {
+        return res.json(fail("该账号已注销，不能重复注册"));
+      }
       return res.json(fail("账号已存在"));
     }
 
     const uid = createUid();
     const passwordHash = await bcrypt.hash(password, PASSWORD_SALT_ROUNDS);
 
-    await pool.execute(
-      `INSERT INTO users
-       (uid, account, nickname, password_hash, login_type, total_reading_seconds, total_audiobook_chars, deleted)
-       VALUES (?, ?, ?, ?, 'password', 0, 0, 0)`,
-      [uid, account, nickname, passwordHash]
-    );
-
-    const userRow = {
+    const user = {
       uid,
       account,
       nickname,
+      passwordHash,
       phone: "",
-      avatar_url: "",
-      login_type: "password"
+      avatarUrl: "",
+      loginType: "password",
+      totalReadingSeconds: 0,
+      totalAudiobookChars: 0,
+      deleted: false,
+      createdAt: now(),
+      updatedAt: now()
     };
 
-    const accessToken = createToken(userRow);
-    res.json(ok({ user: toAccountUser(userRow, accessToken) }));
+    await users.add(user);
+
+    const accessToken = createToken(user);
+
+    res.json(ok({
+      user: toAccountUser(user, accessToken)
+    }));
   } catch (error) {
     console.error("register failed:", error);
     res.json(fail(error.message || "注册失败"));
@@ -173,24 +233,28 @@ app.post("/auth/password/login", async (req, res) => {
       return res.json(fail("请输入密码"));
     }
 
-    const [rows] = await pool.execute(
-      "SELECT * FROM users WHERE account = ? AND deleted = 0 LIMIT 1",
-      [account]
-    );
+    const user = await findUserByAccount(account);
 
-    if (!rows.length) {
+    if (!user) {
       return res.json(fail("账号不存在"));
     }
 
-    const user = rows[0];
-    const matched = await bcrypt.compare(password, user.password_hash);
+    const matched = await bcrypt.compare(password, user.passwordHash || "");
 
     if (!matched) {
       return res.json(fail("密码错误"));
     }
 
+    await users.doc(user._id).update({
+      lastLoginAt: now(),
+      updatedAt: now()
+    });
+
     const accessToken = createToken(user);
-    res.json(ok({ user: toAccountUser(user, accessToken) }));
+
+    res.json(ok({
+      user: toAccountUser(user, accessToken)
+    }));
   } catch (error) {
     console.error("login failed:", error);
     res.json(fail(error.message || "登录失败"));
@@ -210,17 +274,17 @@ app.post("/auth/password/change", authRequired, async (req, res) => {
       return res.json(fail("新密码长度需为6-32位"));
     }
 
-    const matched = await bcrypt.compare(oldPassword, req.user.password_hash);
+    const matched = await bcrypt.compare(oldPassword, req.user.passwordHash || "");
     if (!matched) {
       return res.json(fail("原密码错误"));
     }
 
     const newHash = await bcrypt.hash(newPassword, PASSWORD_SALT_ROUNDS);
 
-    await pool.execute(
-      "UPDATE users SET password_hash = ? WHERE uid = ?",
-      [newHash, req.user.uid]
-    );
+    await users.doc(req.user._id).update({
+      passwordHash: newHash,
+      updatedAt: now()
+    });
 
     res.json(ok());
   } catch (error) {
@@ -230,16 +294,16 @@ app.post("/auth/password/change", authRequired, async (req, res) => {
 });
 
 app.post("/auth/logout", authRequired, async (req, res) => {
-  // 当前使用 JWT，无服务端 token 表；客户端删除本地 token 即可。
   res.json(ok());
 });
 
 app.post("/account/delete", authRequired, async (req, res) => {
   try {
-    await pool.execute(
-      "UPDATE users SET deleted = 1, account = CONCAT(account, '_deleted_', uid) WHERE uid = ?",
-      [req.user.uid]
-    );
+    await users.doc(req.user._id).update({
+      deleted: true,
+      account: `${req.user.account}_deleted_${req.user.uid}`,
+      updatedAt: now()
+    });
 
     res.json(ok());
   } catch (error) {
@@ -250,24 +314,17 @@ app.post("/account/delete", authRequired, async (req, res) => {
 
 app.post("/user/stats/sync", authRequired, async (req, res) => {
   try {
-    const totalReadingSeconds = Number(req.body.totalReadingSeconds || 0);
-    const totalAudiobookChars = Number(req.body.totalAudiobookChars || 0);
+    const totalReadingSeconds = safeNumber(req.body.totalReadingSeconds);
+    const totalAudiobookChars = safeNumber(req.body.totalAudiobookChars);
 
-    if (!Number.isFinite(totalReadingSeconds) || totalReadingSeconds < 0) {
-      return res.json(fail("阅读时长数据异常"));
-    }
+    const oldReading = safeNumber(req.user.totalReadingSeconds);
+    const oldAudio = safeNumber(req.user.totalAudiobookChars);
 
-    if (!Number.isFinite(totalAudiobookChars) || totalAudiobookChars < 0) {
-      return res.json(fail("听书字数数据异常"));
-    }
-
-    await pool.execute(
-      `UPDATE users
-       SET total_reading_seconds = GREATEST(total_reading_seconds, ?),
-           total_audiobook_chars = GREATEST(total_audiobook_chars, ?)
-       WHERE uid = ? AND deleted = 0`,
-      [Math.floor(totalReadingSeconds), Math.floor(totalAudiobookChars), req.user.uid]
-    );
+    await users.doc(req.user._id).update({
+      totalReadingSeconds: Math.max(oldReading, totalReadingSeconds),
+      totalAudiobookChars: Math.max(oldAudio, totalAudiobookChars),
+      updatedAt: now()
+    });
 
     res.json(ok());
   } catch (error) {
@@ -278,32 +335,32 @@ app.post("/user/stats/sync", authRequired, async (req, res) => {
 
 app.post("/rankings", async (req, res) => {
   try {
-    const [readingRows] = await pool.execute(
-      `SELECT nickname, total_reading_seconds AS value
-       FROM users
-       WHERE deleted = 0
-       ORDER BY total_reading_seconds DESC
-       LIMIT 50`
-    );
+    const readingResult = await users
+      .where({
+        deleted: false
+      })
+      .orderBy("totalReadingSeconds", "desc")
+      .limit(50)
+      .get();
 
-    const [audioRows] = await pool.execute(
-      `SELECT nickname, total_audiobook_chars AS value
-       FROM users
-       WHERE deleted = 0
-       ORDER BY total_audiobook_chars DESC
-       LIMIT 50`
-    );
+    const audioResult = await users
+      .where({
+        deleted: false
+      })
+      .orderBy("totalAudiobookChars", "desc")
+      .limit(50)
+      .get();
 
-    const readingTime = readingRows.map((row, index) => ({
+    const readingTime = (readingResult.data || []).map((row, index) => ({
       rank: index + 1,
       nickname: row.nickname || `读者${index + 1}`,
-      value: Number(row.value || 0)
+      value: safeNumber(row.totalReadingSeconds)
     }));
 
-    const audiobookChars = audioRows.map((row, index) => ({
+    const audiobookChars = (audioResult.data || []).map((row, index) => ({
       rank: index + 1,
       nickname: row.nickname || `读者${index + 1}`,
-      value: Number(row.value || 0)
+      value: safeNumber(row.totalAudiobookChars)
     }));
 
     res.json(ok({
@@ -316,7 +373,6 @@ app.post("/rankings", async (req, res) => {
   }
 });
 
-const port = Number(process.env.PORT || 80);
-app.listen(port, "0.0.0.0", () => {
-  console.log(`server running on port ${port}`);
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`server running on port ${PORT}`);
 });
